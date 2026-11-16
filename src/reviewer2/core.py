@@ -42,6 +42,10 @@ MODELS = {
     "pro_3_1": "gemini-3.1-pro-preview"
 }
 
+# Preview models (gemini-3-flash-preview, gemini-3.1-pro-preview) exist only
+# on v1beta. google-genai 3.x defaults to v1, which returns 404 for them.
+GEMINI_API_VERSION = "v1beta"
+
 def get_or_upload_file(client, file_path, force_upload=False):
     """
     Checks if file is already uploaded in this session.
@@ -113,7 +117,7 @@ def cleanup_resources():
         return
 
     try:
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=api_key, http_options=types.HttpOptions(api_version=GEMINI_API_VERSION))
         for path, file_obj in list(_FILE_CACHE.items()):
             try:
                 client.files.delete(name=file_obj.name)
@@ -161,7 +165,7 @@ def call_gemini(prompt=None, pdf_file_path=None, model_type="flash_lite",
     # 1800s default suits the PDF-reading stages; a caller doing a quick lookup
     # (ref-check grounding) passes a much shorter value so a dead socket fails
     # fast instead of stalling the whole run.
-    http_options = types.HttpOptions(client_args={'timeout': timeout})
+    http_options = types.HttpOptions(api_version=GEMINI_API_VERSION, client_args={'timeout': timeout})
     client = genai.Client(api_key=api_key, http_options=http_options)
 
     # =========================================================================
