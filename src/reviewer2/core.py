@@ -7,14 +7,13 @@ import re
 import atexit
 import threading
 from datetime import datetime
+from pathlib import Path
 from pypdf import PdfWriter, PdfReader
 
 from reviewer2.paths import prompt_path
 
 # --- SDK IMPORT ---
-from google import genai
-from google.genai import types
-from google.genai.types import SafetySetting, HarmCategory, HarmBlockThreshold
+import anthropic
 
 # Global Usage Log
 USAGE_LOG = []
@@ -23,34 +22,78 @@ USAGE_LOG = []
 CURRENT_JOB_UUID = None
 
 # GLOBAL CACHE REGISTRY
-# Format: { "path/to/local/file.pdf": uploaded_file_object }
+# Format: { "path/to/local/file.pdf": file_id }
 _FILE_CACHE = {}
 # Stages now run concurrently, so the first upload of a shared PDF must be
 # serialized per path or every parallel stage re-uploads the same 50MB file.
 _CACHE_LOCK = threading.Lock()
 _UPLOAD_LOCKS = {}
 
+# Stage code names a tier per call. Every tier runs on Claude Opus 5.5; the
+# tiers differ in reasoning effort instead (see _effort_for). To run a tier on
+# another model, change it here or set REVIEWER2_MODEL_OVERRIDE to a tier key
+# or a Claude model ID.
+DEFAULT_MODEL = "claude-opus-5-5"
 MODELS = {
-    "flash_lite": "gemini-2.5-flash-lite",
-    "flash_lite_3": "gemini-3.1-flash-lite-preview",
-    "flash_2_5": "gemini-2.5-flash",
-    "flash_3": "gemini-3-flash-preview",
-    "pro_2_5": "gemini-2.5-pro",
-    "pro_3": "gemini-3-pro-preview",
-    "pro_3_1": "gemini-3.1-pro-preview"
+    "flash_lite": DEFAULT_MODEL,
+    "flash_lite_3": DEFAULT_MODEL,
+    "flash_2_5": DEFAULT_MODEL,
+    "flash_3": DEFAULT_MODEL,
+    "pro_2_5": DEFAULT_MODEL,
+    "pro_3": DEFAULT_MODEL,
+    "pro_3_1": DEFAULT_MODEL,
 }
+
+# Models that accept the server-side refusal fallback. On a safety-classifier
+# decline the API re-runs the same request on a fallback model in one call.
+_FALLBACK_MODELS = {"claude-opus-5-5", "claude-sonnet-5-5"}
+_FALLBACK_BETA = "server-side-fallback-2026-07-01"
+
+# The PDF prefix is reused by dozens of stages over a run that can last 45
+# minutes, longer than the default 5-minute cache lifetime.
+_PDF_CACHE_CONTROL = {"type": "ephemeral", "ttl": "1h"}
+
+# Default output ceiling. Thinking counts toward it, so callers' small caps
+# (written for answer length alone) are raised to at least _MIN_MAX_TOKENS.
+_DEFAULT_MAX_TOKENS = 64000
+_MIN_MAX_TOKENS = 16000
+_MAX_CONTINUATIONS = 5
+
+
+def _model_override():
+    return os.environ.get("REVIEWER2_MODEL_OVERRIDE")
+
+
+def _effort_for(thinking_level, thinking_budget):
+    """Translate the Gemini-era thinking knobs to a Claude effort level.
+
+    thinking_level ("low" / "medium" / "high") maps one-to-one. A fixed
+    thinking_budget (0, 512, 1000: short clerical stages) maps to "low"; the
+    dynamic budget (-1) and no setting map to "medium".
+    """
+    if thinking_level in ("low", "medium", "high", "xhigh", "max"):
+        return thinking_level
+    if thinking_budget is not None and int(thinking_budget) >= 0:
+        return "low"
+    return "medium"
+
+
+def _get_client(timeout):
+    # Finite read timeout: a silently dead connection (e.g. local link drop)
+    # must surface as an exception for the retry loop, not block forever.
+    # Retries are handled by call_claude's own loop, so the SDK's are off.
+    return anthropic.Anthropic(timeout=timeout, max_retries=0)
+
 
 def get_or_upload_file(client, file_path, force_upload=False):
     """
     Checks if file is already uploaded in this session.
-    If yes, returns existing handle. If no (or force=True), uploads and caches it.
+    If yes, returns existing file ID. If no (or force=True), uploads and caches it.
     """
     global _FILE_CACHE
 
     with _CACHE_LOCK:
         if not force_upload and file_path in _FILE_CACHE:
-            # Optional: could verify file state here, but that adds latency.
-            # We rely on the 403 retry logic to handle stale files.
             return _FILE_CACHE[file_path]
         path_lock = _UPLOAD_LOCKS.setdefault(file_path, threading.Lock())
 
@@ -62,11 +105,10 @@ def get_or_upload_file(client, file_path, force_upload=False):
 
 
 def _upload_file(client, file_path):
-    # Shrink oversized PDFs under Gemini's 50MB document limit by stripping
-    # photographic figures (which the finders ignore) while preserving text
-    # and tables. No-op for PDFs already under the target. Lazy import so a
-    # missing PyMuPDF degrades to uploading the original rather
-    # than breaking core.py at import time.
+    # Shrink oversized PDFs by stripping photographic figures (which the
+    # finders ignore) while preserving text and tables. No-op for PDFs already
+    # under the target. Lazy import so a missing PyMuPDF degrades to uploading
+    # the original rather than breaking core.py at import time.
     upload_path = file_path
     if isinstance(file_path, str) and file_path.lower().endswith(".pdf"):
         try:
@@ -78,24 +120,26 @@ def _upload_file(client, file_path):
                       f"(stripped {cinfo['stripped']} figure image(s); "
                       f"{cinfo['protected']} protected)")
                 if cinfo.get("over_limit"):
-                    print("    ⚠ still over Gemini's 50MB limit after stripping; "
+                    print("    ⚠ still over the 50MB target after stripping; "
                           "upload may be rejected")
             upload_path = compressed
         except Exception as e:
             print(f"    ⚠ PDF compression skipped ({e}); uploading original")
             upload_path = file_path
 
-    print(f"    ↳ 📤 Uploading NEW file to Gemini: {os.path.basename(file_path)}...")
+    print(f"    ↳ 📤 Uploading NEW file to Claude Files API: {os.path.basename(file_path)}...")
     try:
-        uploaded_file = client.files.upload(file=upload_path)
-        _FILE_CACHE[file_path] = uploaded_file
-        print(f"    ✓ Upload complete: {uploaded_file.name} (Cached)")
-        return uploaded_file
+        uploaded = client.files.upload(
+            file=(os.path.basename(file_path), Path(upload_path).read_bytes(), "application/pdf"))
+        _FILE_CACHE[file_path] = uploaded.id
+        print(f"    ✓ Upload complete: {uploaded.id} (Cached)")
+        return uploaded.id
     except Exception as e:
         # If upload fails, ensure we don't leave bad cache
         if file_path in _FILE_CACHE:
             del _FILE_CACHE[file_path]
         raise IOError(f"Error uploading PDF '{file_path}': {e}")
+
 
 def cleanup_resources():
     """
@@ -105,21 +149,17 @@ def cleanup_resources():
     if not _FILE_CACHE:
         return
 
-    print("\n🧹 Cleaning up Gemini resources...")
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key: 
-        return
-
+    print("\n🧹 Cleaning up Claude Files API uploads...")
     try:
-        client = genai.Client(api_key=api_key)
-        for path, file_obj in list(_FILE_CACHE.items()):
+        client = _get_client(60)
+        for path, file_id in list(_FILE_CACHE.items()):
             try:
-                client.files.delete(name=file_obj.name)
-                print(f"  ✓ Deleted remote file: {file_obj.name}")
+                client.files.delete(file_id)
+                print(f"  ✓ Deleted remote file: {file_id}")
+            except anthropic.NotFoundError:
+                pass  # already gone
             except Exception as e:
-                # 404 means it's already gone, which is fine.
-                if "404" not in str(e):
-                    print(f"  ⚠ Failed to delete {file_obj.name}: {e}")
+                print(f"  ⚠ Failed to delete {file_id}: {e}")
         _FILE_CACHE.clear()
     except Exception as e:
         print(f"  ⚠ Cleanup initialization failed: {e}")
@@ -127,339 +167,183 @@ def cleanup_resources():
 # Register cleanup to run automatically on exit
 atexit.register(cleanup_resources)
 
-def call_gemini(prompt=None, pdf_file_path=None, model_type="flash_lite",
-                temperature=0.1, thinking_level=None, thinking_budget=None,
-                media_resolution="MEDIA_RESOLUTION_MEDIUM", system_instruction=None,
+
+def _log_usage(response, step):
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return
+    USAGE_LOG.append({
+        "model_name": getattr(response, "model", None) or DEFAULT_MODEL,
+        "input_tokens": usage.input_tokens or 0,
+        "cache_write_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
+        # Claude's output_tokens already includes thinking.
+        "output_tokens": usage.output_tokens or 0,
+        "thoughts_tokens": 0,
+        "timestamp": datetime.now().isoformat(),
+        "step": step or "unknown",
+        "job_uuid": CURRENT_JOB_UUID,
+    })
+
+
+class _Fatal(RuntimeError):
+    """An error that retrying cannot fix."""
+
+
+def call_claude(prompt=None, pdf_file_path=None, model_type="flash_lite",
+                temperature=None, thinking_level=None, thinking_budget=None,
+                media_resolution=None, system_instruction=None,
                 max_retries=10, retry_forever_on_rate_limit=True,
                 step=None, use_search=False, max_output_tokens=None,
                 use_code_exec=False, timeout=1800):
     """
-    Call Gemini API with robust retry logic and proper Content structure.
-    Uses caching for PDF uploads, with auto-invalidation on permission errors.
-    """
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY not found in environment")
+    Call Claude with retry logic and return the response text.
 
-    override = os.environ.get("GEMINI_MODEL_OVERRIDE")
-    if override:
-        model_type = override
+    The PDF is uploaded once per run through the Files API and cached in the
+    prompt cache, so the stages that share it pay for it once per hour.
+
+    ``temperature`` and ``media_resolution`` are accepted for compatibility
+    with the stage code and ignored: current Claude models reject sampling
+    parameters, and PDF pages are read at a fixed resolution.
+    """
+    model_type = _model_override() or model_type
 
     # Env-gated code execution: comma-separated step names in CODE_EXEC_STEPS
     if step and step in os.environ.get("CODE_EXEC_STEPS", "").split(","):
         use_code_exec = True
 
     model_name = MODELS.get(model_type, model_type)
-    if not model_name:
-        print(f"  ⚠  Warning: Unknown model_type '{model_type}', falling back to flash_lite")
-        model_name = MODELS["flash_lite"]
+    if not model_name.startswith("claude-"):
+        print(f"  ⚠  Warning: Unknown model_type '{model_type}', falling back to {DEFAULT_MODEL}")
+        model_name = DEFAULT_MODEL
 
-    # Finite read timeout: a silently dead connection (e.g. local link drop)
-    # must surface as an exception for the retry loop, not block forever. The
-    # 1800s default suits the PDF-reading stages; a caller doing a quick lookup
-    # (ref-check grounding) passes a much shorter value so a dead socket fails
-    # fast instead of stalling the whole run.
-    http_options = types.HttpOptions(client_args={'timeout': timeout})
-    client = genai.Client(api_key=api_key, http_options=http_options)
+    client = _get_client(timeout)
 
-    # =========================================================================
-    # SAFETY SETTINGS
-    # =========================================================================
-    safety_settings = [
-        SafetySetting(
-            category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-            threshold=HarmBlockThreshold.BLOCK_NONE,
-        ),
-        SafetySetting(
-            category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-            threshold=HarmBlockThreshold.BLOCK_NONE,
-        ),
-        SafetySetting(
-            category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-            threshold=HarmBlockThreshold.BLOCK_NONE,
-        ),
-        SafetySetting(
-            category=HarmCategory.HARM_CATEGORY_HARASSMENT,
-            threshold=HarmBlockThreshold.BLOCK_NONE,
-        ),
-    ]
-
-    # =========================================================================
-    # THINKING CONFIG (Fixed for Gemini 3)
-    # =========================================================================
-    thinking_cfg = None
-    model_supports_thinking = (
-        "pro" in model_type or 
-        "2.5" in model_type or 
-        "flash" in model_type or 
-        "3" in model_name
-    )
-    
-    if model_supports_thinking:
-        # If the user passes a specific integer budget (Gemini 2.5 style)
-        if thinking_budget is not None:
-             thinking_cfg = types.ThinkingConfig(thinking_budget=int(thinking_budget))
-             
-        # If the user passes a level string (Gemini 3 style: low, medium, high)
-        elif thinking_level:
-            # Gemini 3 requires valid strings. Default to "include_thoughts=False" (summary only)
-            # unless you specifically want to see the raw thoughts for debugging.
-            thinking_cfg = types.ThinkingConfig(
-                thinking_level=thinking_level, 
-                include_thoughts=False # Change to True if you want to debug the thoughts
-            )
-            
-        # Default behavior (Dynamic)
-        else:
-             thinking_cfg = types.ThinkingConfig(thinking_budget=-1)
-
-    # =========================================================================
-    # TOOLS (SEARCH)
-    # =========================================================================
     tools = None
     if use_search:
-        # Enable Google Search Grounding
-        tools = [types.Tool(google_search=types.GoogleSearch())]
+        tools = [{"type": "web_search_20260209", "name": "web_search"}]
     elif use_code_exec:
-        # Enable Python code execution (numerical checks in the 01fe defence)
-        tools = [types.Tool(code_execution=types.ToolCodeExecution())]
+        # Python sandbox for numerical checks (the 01fe defence)
+        tools = [{"type": "code_execution_20260521", "name": "code_execution"}]
 
-    # =========================================================================
-    # RETRY LOOP
-    # =========================================================================
+    params = {
+        "model": model_name,
+        "max_tokens": max(max_output_tokens or _DEFAULT_MAX_TOKENS, _MIN_MAX_TOKENS),
+        "output_config": {"effort": _effort_for(thinking_level, thinking_budget)},
+    }
+    if system_instruction:
+        params["system"] = system_instruction
+    if tools:
+        params["tools"] = tools
+    if model_name in _FALLBACK_MODELS:
+        params["betas"] = [_FALLBACK_BETA]
+        params["fallbacks"] = "default"
+
     attempt = 0
     base_delay = 5
     max_delay = 300
-    
-    # Track if we have forced a re-upload for this specific call
-    has_forced_reupload = False
+    force_reupload = False
 
     while True:
         attempt += 1
-        
-        # ---------------------------------------------------------------------
-        # PREPARE CONTENTS (Done inside loop to handle re-uploads)
-        # ---------------------------------------------------------------------
-        parts = []
-        current_uploaded_file = None
-
-        if pdf_file_path:
-            # If we previously hit a 403 on the file, we force upload
-            force = (attempt > 1 and has_forced_reupload)
-            try:
-                current_uploaded_file = get_or_upload_file(client, pdf_file_path, force_upload=force)
-                # Reset flag so we don't upload every single retry if it was a different error
-                has_forced_reupload = False 
-                
-                parts.append(types.Part.from_uri(
-                    file_uri=current_uploaded_file.uri,
-                    mime_type="application/pdf"
-                ))
-            except Exception as e:
-                print(f"    ⚠  Upload failed inside retry loop: {e}")
-                # If upload fails, we likely can't proceed, but we'll let the loop handle delay
-                time.sleep(5)
-                continue
-
-        if prompt:
-            parts.append(types.Part.from_text(text=prompt))
-
-        contents = [types.Content(role="user", parts=parts)]
-
-        # ---------------------------------------------------------------------
-        # BUILD CONFIG
-        # ---------------------------------------------------------------------
-        formatted_system_instruction = None
-        if system_instruction:
-            formatted_system_instruction = [types.Part.from_text(text=system_instruction)]
-
-        gen_config = types.GenerateContentConfig(
-            temperature=temperature,
-            system_instruction=formatted_system_instruction,
-            thinking_config=thinking_cfg,
-            media_resolution=media_resolution,
-            safety_settings=safety_settings,
-            tools=tools,
-            max_output_tokens=max_output_tokens
-        )
-
-        # ---------------------------------------------------------------------
-        # EXECUTE REQUEST
-        # ---------------------------------------------------------------------
         try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=gen_config
-            )
-
-            if response is None:
-                raise ValueError("API returned None response object")
-
-            # Safe Usage Logging
-            usage_meta = getattr(response, "usage_metadata", None)
-            if usage_meta:
-                p_tok = getattr(usage_meta, 'prompt_token_count', 0) or 0
-                c_tok = getattr(usage_meta, 'candidates_token_count', 0) or 0
-                t_tok = getattr(usage_meta, 'thoughts_token_count', 0) or 0
-                
-                USAGE_LOG.append({
-                    "model_name": model_name,
-                    "input_tokens": p_tok,
-                    "output_tokens": c_tok + t_tok,
-                    "thoughts_tokens": t_tok,
-                    "timestamp": datetime.now().isoformat(),
-                    "step": step or "unknown",
-                    "job_uuid": CURRENT_JOB_UUID
+            # Build the user turn inside the loop so a re-upload takes effect.
+            content = []
+            if pdf_file_path:
+                file_id = get_or_upload_file(client, pdf_file_path, force_upload=force_reupload)
+                force_reupload = False
+                content.append({
+                    "type": "document",
+                    "source": {"type": "file", "file_id": file_id},
+                    "cache_control": _PDF_CACHE_CONTROL,
                 })
+            if prompt:
+                content.append({"type": "text", "text": prompt})
+            messages = [{"role": "user", "content": content}]
 
-            # Safe Text Extraction
-            try:
-                # 1. Global Feedback Check (Did the prompt trigger a block immediately?)
-                feedback = getattr(response, "prompt_feedback", None)
-                if feedback and getattr(feedback, "block_reason", None):
-                    error_msg = f"FATAL: Prompt blocked by filters: {feedback.block_reason}"
-                    print(f"    ❌ {error_msg}")
-                    raise RuntimeError(error_msg)
+            # Server tools can pause a long turn; resend to let it continue.
+            for _ in range(_MAX_CONTINUATIONS + 1):
+                with client.beta.messages.stream(messages=messages, **params) as stream:
+                    response = stream.get_final_message()
+                _log_usage(response, step)
+                if response.stop_reason != "pause_turn":
+                    break
+                messages = messages[:1] + [{"role": "assistant", "content": response.content}]
 
-                candidates = getattr(response, "candidates", []) or []
-                if not candidates:
-                    # If candidates list is empty, it's usually a hard block or server failure.
-                    # We treat this as retryable unless we can prove otherwise, but often it's safety.
-                    raise ValueError("No candidates returned (Possible Safety Block or Empty Response)")
+            if response.stop_reason == "refusal":
+                details = getattr(response, "stop_details", None)
+                raise _Fatal(f"FATAL: Claude declined the request ({getattr(details, 'category', None)}).")
 
-                # 2. Check Candidate Finish Reasons (The Critical Fix)
-                # We check the first candidate (usually the only one)
-                first_cand = candidates[0]
-                finish_reason = str(getattr(first_cand, "finish_reason", "UNKNOWN"))
-                
-                # Valid reasons are "STOP" (success) or "MAX_TOKENS" (truncated but valid).
-                # Common Failure Reasons: "SAFETY", "RECITATION" (Copyright), "OTHER"
-                valid_reasons = ["STOP", "1", "FinishReason.STOP", "MAX_TOKENS", "2", "FinishReason.MAX_TOKENS"]
-                
-                if finish_reason not in valid_reasons:
-                    safety_ratings = getattr(first_cand, "safety_ratings", "Unknown")
-                    error_msg = f"FATAL: Generation stopped. Reason: {finish_reason}. Ratings: {safety_ratings}"
-                    print(f"    ❌ {error_msg}")
-                    raise RuntimeError(error_msg)
+            result = "".join(b.text for b in response.content if b.type == "text").strip()
+            if not result:
+                if response.stop_reason == "max_tokens":
+                    raise _Fatal("FATAL: Model hit max_tokens and returned no text.")
+                raise ValueError(f"API returned empty text (stop_reason={response.stop_reason})")
+            return result
 
-                # 3. Extract Text (Thinking vs Standard)
-                if thinking_cfg:
-                    final_text = []
-                    content = getattr(first_cand, "content", None)
-                    parts = getattr(content, "parts", None)
-                    
-                    if parts is None:
-                        # --- MODIFIED BLOCK START ---
-                        # If the model hit the limit and returned nothing, we MUST stop.
-                        # Adding "FATAL" to the string kills the retry loop.
-                        if "MAX_TOKENS" in str(finish_reason):
-                             raise ValueError(f"FATAL: Model hit MAX_TOKENS and returned no content. (Finish Reason: {finish_reason})")
-                        else:
-                             raise ValueError(f"API returned malformed content: 'parts' is None (Finish Reason: {finish_reason})")
-                        # --- MODIFIED BLOCK END ---
+        except _Fatal:
+            raise
 
-                    for part in parts:
-                        # Filter out thoughts, keep text
-                        if part.text and not getattr(part, 'thought', False): 
-                            final_text.append(part.text)
-                    
-                    result = "".join(final_text).strip()
-                else:
-                    # Standard Model Extraction
-                    # We prefer using the direct .text accessor if available, but safeguard it
-                    if hasattr(response, 'text') and response.text:
-                        result = response.text
-                    else:
-                        # Manual extraction if helper fails
-                        content = getattr(first_cand, "content", None)
-                        parts = getattr(content, "parts", None)
-                        if parts and len(parts) > 0:
-                            result = parts[0].text
-                        else:
-                             raise ValueError("Standard model returned no text parts.")
+        except IOError as e:
+            print(f"    ⚠  Upload failed inside retry loop: {e}")
+            if attempt >= max_retries:
+                raise RuntimeError(f"PDF upload failed after {attempt} attempts: {e}")
+            time.sleep(5)
+            continue
 
-                if not result or not result.strip():
-                    raise ValueError("API returned empty string")
-                    
-                return result
-                
-            except Exception as e:
-                # If we identified a FATAL error above, re-raise it to break the loop
-                if "FATAL" in str(e):
-                    raise e
-                    
-                # Standard retries for other extraction errors
-                if "API returned malformed content" in str(e):
-                    raise e
-                    
-                raise ValueError(f"Failed to extract text from response: {e}")
+        except anthropic.NotFoundError as e:
+            # A cached file can expire or be deleted mid-run: re-upload once.
+            if pdf_file_path and attempt == 1:
+                print("    ⚠  File not found (404). Re-uploading on next attempt.")
+                with _CACHE_LOCK:
+                    _FILE_CACHE.pop(pdf_file_path, None)
+                force_reupload = True
+                continue
+            raise RuntimeError(f"FATAL: Not found: {e}")
+
+        except (anthropic.BadRequestError, anthropic.AuthenticationError,
+                anthropic.PermissionDeniedError) as e:
+            raise RuntimeError(f"FATAL: Claude API rejected the request: {e}")
+
+        except anthropic.RateLimitError as e:
+            delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+            retry_after = e.response.headers.get("retry-after") if e.response is not None else None
+            if retry_after and retry_after.isdigit():
+                delay = max(delay, int(retry_after))
+            print(f"    ↳ Rate Limited (429) on attempt {attempt}. Waiting {delay}s...")
+            if not retry_forever_on_rate_limit and attempt >= max_retries:
+                raise RuntimeError(f"Rate limit exceeded after {attempt} attempts: {e}")
+            time.sleep(delay)
+            continue
+
+        except (anthropic.APIConnectionError, anthropic.APIStatusError) as e:
+            # Connection drops, timeouts, 5xx and 529 overloaded.
+            status = getattr(e, "status_code", None)
+            if status is not None and status < 500:
+                raise RuntimeError(f"FATAL: Claude API error {status}: {e}")
+            delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+            print(f"    ⚠  Server/Network Error (Attempt {attempt}): {str(e)[:200]}. Waiting {delay}s...")
+            if not retry_forever_on_rate_limit and attempt >= max_retries:
+                raise RuntimeError(f"Server error after {attempt} attempts: {e}")
+            time.sleep(delay)
+            continue
 
         except Exception as e:
-            err_str = str(e)
-            
-            # STOP RETRYING ON FATAL ERRORS
-            if "FATAL" in err_str:
-                raise e
-            
-            if "'NoneType' object is not iterable" in err_str:
-                print(f"    ✗ FATAL ERROR: Malformed API response (NoneType iterable). Stopping.")
-                raise e
-
-            # -----------------------------------------------------------------
-            # SPECIAL HANDLING FOR FILE PERMISSIONS (403)
-            # -----------------------------------------------------------------
-            if "403" in err_str and ("access the File" in err_str or "PERMISSION_DENIED" in err_str):
-                print(f"    ⚠  File Permission/Access Error (403). Forcing re-upload on next attempt.")
-                # Mark to force re-upload next loop
-                has_forced_reupload = True
-                # Remove from cache immediately to be safe
-                if pdf_file_path and pdf_file_path in _FILE_CACHE:
-                    del _FILE_CACHE[pdf_file_path]
-                
-                # Short delay for 403, as we have a fix strategy
-                time.sleep(2)
-                if attempt >= max_retries:
-                    raise RuntimeError(f"File access failed after {attempt} attempts: {err_str}")
-                continue
-
-            delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
-            
-            if "429" in err_str:
-                print(f"    ↳ Rate Limited (429) on attempt {attempt}. Waiting {delay}s...")
-                time.sleep(delay)
-                if not retry_forever_on_rate_limit and attempt >= max_retries:
-                    raise RuntimeError(f"Rate limit exceeded after {attempt} attempts: {err_str}")
-                continue
-                    
-            elif "Server disconnected" in err_str or "RemoteProtocolError" in err_str:
-                print(f"    ⚠  Network Timeout (Attempt {attempt}/{max_retries}). Retrying in {delay}s...")
-                time.sleep(delay)
-                
-            elif "500" in err_str or "503" in err_str or "502" in err_str:
-                print(f"    ⚠  Server Error (Attempt {attempt}). Waiting {delay}s...")
-                time.sleep(delay)
-                if not retry_forever_on_rate_limit and attempt >= max_retries:
-                    raise RuntimeError(f"Server error after {attempt} attempts: {err_str}")
-                continue
-                
-            else:
-                print(f"    ⚠  API Error (Attempt {attempt}/{max_retries}): {err_str[:200]}")
-                time.sleep(min(delay, 30))
-            
+            delay = min(base_delay * (2 ** (attempt - 1)), 30)
+            print(f"    ⚠  API Error (Attempt {attempt}/{max_retries}): {str(e)[:200]}")
             if attempt >= max_retries:
-                raise RuntimeError(f"Gemini API call failed after {attempt} attempts. Last error: {err_str}")
+                raise RuntimeError(f"Claude API call failed after {attempt} attempts. Last error: {e}")
+            time.sleep(delay)
 
 
 # =============================================================================
 # OPTIONAL PROVIDER ROUTING
 # =============================================================================
 # When DEEPSEEK_API_KEY is set, these clerical stages go to DeepSeek V4 Flash,
-# which is much cheaper than Gemini Flash for them. They work purely on prior
-# text: DeepSeek has no PDF vision, so ONLY stages whose prompt is fully
-# self-contained in text belong here. 00b_metadata_clean's prompt says "rely
-# ONLY on the INPUT DATA", so it qualifies. Without the key, everything runs
-# on Gemini.
+# which is much cheaper for them. They work purely on prior text: DeepSeek has
+# no PDF vision, so ONLY stages whose prompt is fully self-contained in text
+# belong here. 00b_metadata_clean's prompt says "rely ONLY on the INPUT DATA",
+# so it qualifies. Without the key, everything runs on Claude.
 DS_FLASH_STAGES = {
     "00b_metadata_clean",
     "00b_2_metadata_math",
@@ -473,12 +357,11 @@ DS_FLASH_STAGES = {
 def call_model(prompt=None, pdf_file_path=None, model_type="flash_lite",
                step=None, **kwargs):
     """Dispatcher used by the bureaucratic stages. Routes DS_FLASH_STAGES to
-    DeepSeek V4 Flash, everything else to Gemini. A GEMINI_MODEL_OVERRIDE
-    (cheap test runs) keeps everything on Gemini. The DeepSeek path drops the PDF —
-    these stages are text-only by construction — and falls back to Gemini on
-    any DeepSeek error so a bureaucratic stage can never sink a report."""
-    override = os.environ.get("GEMINI_MODEL_OVERRIDE")
-    route_ds = (step in DS_FLASH_STAGES and not override
+    DeepSeek V4 Flash, everything else to Claude. A REVIEWER2_MODEL_OVERRIDE
+    keeps everything on Claude. The DeepSeek path drops the PDF — these stages
+    are text-only by construction — and falls back to Claude on any DeepSeek
+    error so a bureaucratic stage can never sink a report."""
+    route_ds = (step in DS_FLASH_STAGES and not _model_override()
                 and os.environ.get("DEEPSEEK_API_KEY"))
     if route_ds:
         try:
@@ -494,8 +377,8 @@ def call_model(prompt=None, pdf_file_path=None, model_type="flash_lite",
                 max_output_tokens=kwargs.get("max_output_tokens"),
             )
         except Exception as e:
-            print(f"    ⚠  DeepSeek failed for {step} ({e}); falling back to Gemini")
-    return call_gemini(prompt, pdf_file_path, model_type=model_type, step=step, **kwargs)
+            print(f"    ⚠  DeepSeek failed for {step} ({e}); falling back to Claude")
+    return call_claude(prompt, pdf_file_path, model_type=model_type, step=step, **kwargs)
 
 
 def save_output(content, filename, output_dir):

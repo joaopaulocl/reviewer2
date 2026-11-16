@@ -119,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: PDF not found: {pdf_path}", file=sys.stderr)
         return 2
 
-    _require_env("GEMINI_API_KEY", "for Gemini API access")
+    _require_env("ANTHROPIC_API_KEY", "for Claude API access")
     note = args.note
     if args.note_file:
         note = Path(args.note_file).expanduser().read_text(encoding="utf-8")

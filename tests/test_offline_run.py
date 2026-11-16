@@ -81,8 +81,8 @@ def _make_pdf(path: Path, pages: int = 3) -> None:
 @pytest.fixture
 def offline(monkeypatch):
     for mod in (core, stages, ref_checker):
-        if hasattr(mod, "call_gemini"):
-            monkeypatch.setattr(mod, "call_gemini", fake_call)
+        if hasattr(mod, "call_claude"):
+            monkeypatch.setattr(mod, "call_claude", fake_call)
         if hasattr(mod, "call_model"):
             monkeypatch.setattr(mod, "call_model", fake_call)
     monkeypatch.setattr(stages, "extract_equations_mathpix",
@@ -100,7 +100,7 @@ def offline(monkeypatch):
 
     monkeypatch.setattr(ref_checker.requests, "get", lambda *a, **k: _Resp())
     monkeypatch.setattr(pipeline.time, "sleep", lambda s: None)
-    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
 
 
 def test_full_offline_run(tmp_path, offline):

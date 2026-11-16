@@ -1,6 +1,6 @@
 # reviewer2
 
-Adversarial review of academic PDFs, powered by Google Gemini.
+Adversarial review of academic PDFs, powered by Claude.
 
 `reviewer2` is the pipeline that ran the Reviewer 2 service at
 [isitcredible.com](https://isitcredible.com/), in the final form it took
@@ -26,7 +26,8 @@ and in the [changelog](CHANGELOG.md).
 ## Requirements
 
 - Python 3.10+
-- A Google Gemini API key ([aistudio.google.com](https://aistudio.google.com/))
+- An Anthropic API key ([platform.claude.com](https://platform.claude.com/)). The
+  Gemini version of the pipeline is kept on the `gemini` branch.
 - (Optional) A Mathpix account, for the math-audit add-on
 
 ## Install
@@ -42,8 +43,7 @@ pip install "reviewer2[pdf] @ git+https://github.com/isitcredible/reviewer2"
 pip install "reviewer2[deepseek] @ git+https://github.com/isitcredible/reviewer2"
 ```
 
-- `pdf` installs PyMuPDF, which shrinks PDFs larger than Gemini's 50 MB upload
-  limit (by dropping photographs, never text or tables) and gives a slightly
+- `pdf` installs PyMuPDF, which shrinks PDFs larger than 50 MB (by dropping photographs, never text or tables) and gives a slightly
   better page-number scan. PyMuPDF is licensed under the AGPL-3.0; without it
   the pipeline uses pypdf and uploads large PDFs unchanged.
 - `deepseek` installs the client for the optional DeepSeek routing (see
@@ -63,12 +63,12 @@ The tests run the whole pipeline offline, with canned model responses.
 ## Quickstart
 
 ```bash
-export GEMINI_API_KEY=your_key_here
+export ANTHROPIC_API_KEY=your_key_here
 reviewer2 paper.pdf -o report.txt
 ```
 
-A default run takes 15 to 45 minutes and costs a few dollars in Gemini
-usage. It produces the core review, the reference check, and the
+A default run takes 15 to 45 minutes. Every stage runs on Claude Opus 5.5;
+see Cost. It produces the core review, the reference check, and the
 author-facing editor's note and copyedit. The math and code audits are
 opt-in (see Add-ons).
 
@@ -238,20 +238,25 @@ revision, 6 legal, 7 format, 8–9 author-facing stages.
 
 | Variable                   | Required           | Purpose |
 |----------------------------|--------------------|---------|
-| `GEMINI_API_KEY`           | yes                | Google Gemini API key. |
+| `ANTHROPIC_API_KEY`        | yes                | Anthropic API key. |
 | `MATHPIX_APP_ID`, `MATHPIX_APP_KEY` | only with `--math` | Mathpix credentials. |
 | `REVIEWER2_CONTACT_EMAIL`  | no                 | Your email, sent with OpenAlex and Crossref lookups so the reference check uses their faster "polite pool". |
 | `SEMANTIC_SCHOLAR_API_KEY` | no                 | Adds Semantic Scholar as a lookup source for the reference check (its keyless pool is too rate-limited to use). |
-| `DEEPSEEK_API_KEY`         | no                 | Route six clerical, text-only stages to DeepSeek V4 Flash, which is cheaper. Falls back to Gemini on any error. Needs the `deepseek` extra. |
-| `GEMINI_MODEL_OVERRIDE`    | no                 | Force every stage to one model (e.g. `flash_lite_3`) for cheap test runs. Review quality drops sharply. |
+| `DEEPSEEK_API_KEY`         | no                 | Route six clerical, text-only stages to DeepSeek V4 Flash, which is cheaper. Falls back to Claude on any error. Needs the `deepseek` extra. |
+| `REVIEWER2_MODEL_OVERRIDE` | no                 | Force every stage to one Claude model (e.g. `claude-sonnet-5-5`) for cheaper test runs. Review quality may drop. |
 | `REVIEWER2_PROMPTS_DIR`    | no                 | Load prompts from another directory, for experimenting. |
 
 ## Cost
 
-A default run costs a few dollars in Gemini API usage; a per-stage cost
-breakdown is printed at the end. `--math` and `--code-dir` each add a few
-more. Model prices are in `src/reviewer2/data/pricing.csv`; update them if
-Google's change.
+Every stage runs on Claude Opus 5.5 ($4 / $20 per million input / output
+tokens). The stages differ in reasoning effort rather than model. The paper
+PDF is uploaded once through the Files API and held in the prompt cache for
+an hour, so stages that re-read it pay a fraction of the input price. The
+cost of a default run on Claude has not been measured yet; expect tens of
+dollars rather than the few dollars the Gemini version cost. A per-stage cost
+breakdown is printed at the end. `--math` and `--code-dir` each add more.
+Model prices are in `src/reviewer2/data/pricing.csv`; update them if
+Anthropic's change.
 
 ## License
 

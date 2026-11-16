@@ -3,8 +3,8 @@
 ## Running the pipeline from Claude Code
 
 **Before invoking `reviewer2` on a real paper, confirm with the user.** A
-default run takes 15–45 minutes and costs a few dollars in Gemini API
-usage. That is not a routine command to fire off autonomously.
+default run takes 15–45 minutes and costs tens of dollars in Claude API
+usage (estimate, not yet measured). That is not a routine command to fire off autonomously.
 
 Entry point:
 
@@ -12,7 +12,7 @@ Entry point:
 reviewer2 paper.pdf -o report.txt
 ```
 
-Requires `GEMINI_API_KEY` in the environment. Install for development with
+Requires `ANTHROPIC_API_KEY` in the environment. Install for development with
 `pip install -e ".[pdf,dev]"` from the repo root; `pytest` runs the whole
 pipeline offline with canned model responses.
 

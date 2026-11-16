@@ -436,7 +436,7 @@ def _run_inner(*, pdf_path, work_dir, job_uuid, do_math, do_code, writer_mode,
                 print("  → Page map: reconciled map loaded from cache")
             else:
                 def _reconcile_call(prompt, pdf):
-                    return core.call_gemini(prompt, pdf, model_type="flash_2_5",
+                    return core.call_claude(prompt, pdf, model_type="flash_2_5",
                                             temperature=0.0, thinking_budget=-1,
                                             step="00d_pagemap_reconcile")
                 metadata["page_map"] = pagemap.reconcile_with_flash(

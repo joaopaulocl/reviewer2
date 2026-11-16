@@ -1,6 +1,6 @@
 """Optional DeepSeek V4 client.
 
-Mirrors the shape of core.call_gemini: returns a plain text string and appends
+Mirrors the shape of core.call_claude: returns a plain text string and appends
 to core.USAGE_LOG. core.call_model dispatches here for the no-PDF clerical
 stages when DEEPSEEK_API_KEY is set. Requires the ``openai`` package
 (``pip install reviewer2[deepseek]``).

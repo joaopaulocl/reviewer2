@@ -3,7 +3,7 @@
 # convenience and for CI cache keys. Optional extras (PyMuPDF, openai) are
 # listed in pyproject.toml.
 
-google-genai
+anthropic>=2.9.0
 pypdf
 requests
 reportlab

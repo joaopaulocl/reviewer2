@@ -51,7 +51,7 @@ from difflib import SequenceMatcher
 
 import requests
 
-from reviewer2.core import call_gemini, load_prompt, save_output
+from reviewer2.core import call_claude, load_prompt, save_output
 from reviewer2.helpers import get_citation_block
 
 # --------------------------------------------------------------------------- #
@@ -517,7 +517,7 @@ def grounded_lookup(ref: Reference) -> Candidate | None:
     citation = ref.raw or " ".join(filter(None, [
         _fmt_authors(ref.authors), f"({ref.year})" if ref.year else "", ref.title, ref.venue]))
     try:
-        raw = call_gemini(
+        raw = call_claude(
             prompt=_GROUNDED_PROMPT.format(CITATION=citation), pdf_file_path=None,
             model_type="flash_2_5", temperature=0.0, thinking_budget=0,
             step="reference_grounded", use_search=True, max_output_tokens=2000,
@@ -815,7 +815,7 @@ _EXTRACT_RETRY_PAUSE = 2.0  # seconds between retries
 
 
 def _extract_once(pdf_path: str) -> list[Reference]:
-    raw = call_gemini(
+    raw = call_claude(
         prompt=_EXTRACT_PROMPT, pdf_file_path=pdf_path,
         model_type="flash_2_5", temperature=0.0, thinking_budget=0,
         step="reference_extract", max_output_tokens=60000,
@@ -867,7 +867,7 @@ def verify_and_merge(pdf_path: str, refs: list[Reference]) -> list[Reference]:
           "venue": r.venue, "doi": r.doi, "type": r.type, "raw": r.raw} for r in refs],
         ensure_ascii=False)
     try:
-        raw = call_gemini(
+        raw = call_claude(
             prompt=_VERIFY_PROMPT.replace("{LIST}", listing), pdf_file_path=pdf_path,
             model_type="flash_2_5", temperature=0.0, thinking_budget=512,
             step="reference_verify", max_output_tokens=30000,
@@ -980,7 +980,7 @@ def classify_flagged(flagged: list[dict]) -> dict[int, dict]:
         return {}
     listing = "\n".join(f'{i}. {r.get("citation", "")}' for i, r in enumerate(flagged))
     try:
-        raw = call_gemini(
+        raw = call_claude(
             prompt=_CLASSIFY_PROMPT.replace("{LIST}", listing), pdf_file_path=None,
             model_type="flash_2_5", temperature=0.0, thinking_budget=0,
             use_search=True, step="reference_classify", max_output_tokens=8000,
@@ -1091,7 +1091,7 @@ def write_section(triage: dict, metadata: dict, output_dir: str) -> str:
     prompt = load_prompt("prompts/reference_check.txt")
     prompt = prompt.replace("{{CITATION}}", get_citation_block(metadata))
     prompt = prompt.replace("{{REFERENCE_TRIAGE}}", _writer_payload(triage))
-    return call_gemini(prompt, None, model_type="pro_3_1", temperature=0.3,
+    return call_claude(prompt, None, model_type="pro_3_1", temperature=0.3,
                        thinking_level="low", step="reference_check").strip()
 
 

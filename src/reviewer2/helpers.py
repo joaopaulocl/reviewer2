@@ -407,6 +407,9 @@ def calculate_cost(usage_log, pricing_path=None):
                 "input_price_high": float(row["input_price_high"]),
                 "output_price_high": float(row["output_price_high"]),
                 "cutoff": int(row.get("cutoff") or 128000),
+                # Blank means "same as input price" (models without caching).
+                "cache_write": float(row.get("cache_write_price") or row["input_price_low"]),
+                "cache_read": float(row.get("cache_read_price") or row["input_price_low"]),
             }
 
     total_cost = 0.0
@@ -431,7 +434,10 @@ def calculate_cost(usage_log, pricing_path=None):
         p_out = price["output_price_high"] if is_high else price["output_price_low"]
         c_in = (in_tok / 1e6) * p_in
         c_out = (out_tok / 1e6) * p_out
-        entry_cost = c_in + c_out
+        c_cache = (entry.get("cache_write_tokens", 0) / 1e6) * price["cache_write"] \
+            + (entry.get("cache_read_tokens", 0) / 1e6) * price["cache_read"]
+        in_tok += entry.get("cache_write_tokens", 0) + entry.get("cache_read_tokens", 0)
+        entry_cost = c_in + c_out + c_cache
 
         total_cost += entry_cost
         step_costs[step] = step_costs.get(step, 0) + entry_cost

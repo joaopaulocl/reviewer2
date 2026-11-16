@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "reviewer2"
 version = "2.0.0"
-description = "Adversarial review of academic PDFs, powered by Google Gemini."
+description = "Adversarial review of academic PDFs, powered by Claude."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [{name = "The Catalogue of Errors Ltd"}]
-keywords = ["peer-review", "llm", "gemini", "academic", "pdf"]
+keywords = ["peer-review", "llm", "claude", "academic", "pdf"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Science/Research",
@@ -25,7 +25,7 @@ classifiers = [
     "Topic :: Text Processing",
 ]
 dependencies = [
-    "google-genai",
+    "anthropic>=2.9.0",
     "pypdf",
     "requests",
     "reportlab",
