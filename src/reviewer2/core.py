@@ -30,12 +30,14 @@ _FILE_CACHE = {}
 _CACHE_LOCK = threading.Lock()
 _UPLOAD_LOCKS = {}
 
+# The 2.5 models return 404 "no longer available to new users" for keys
+# created after their retirement, so the 2.5 keys point at current models.
 MODELS = {
-    "flash_lite": "gemini-2.5-flash-lite",
+    "flash_lite": "gemini-3.1-flash-lite",
     "flash_lite_3": "gemini-3.1-flash-lite-preview",
-    "flash_2_5": "gemini-2.5-flash",
+    "flash_2_5": "gemini-3-flash-preview",
     "flash_3": "gemini-3-flash-preview",
-    "pro_2_5": "gemini-2.5-pro",
+    "pro_2_5": "gemini-3.1-pro-preview",
     "pro_3": "gemini-3-pro-preview",
     "pro_3_1": "gemini-3.1-pro-preview"
 }
